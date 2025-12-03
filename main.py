@@ -1,5 +1,6 @@
 import os
 import logging
+import base64
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -20,6 +21,7 @@ if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in environment")
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/"
+TELEGRAM_FILE_API_URL = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # Per-process in-memory storage
@@ -33,6 +35,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+# Only these mimes are supported by Grok, per error message
+ALLOWED_IMAGE_MIME = {
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/webp",
+}
 
 
 # ------------- Telegram helpers ------------- #
@@ -60,8 +70,8 @@ def _send_message_raw(chat_id: int, text: str):
         logger.error("Error sending Telegram message: %s - resp=%s", e, getattr(resp, "text", ""))
 
 
-def get_file_url(file_id: str) -> str:
-    """Get a public HTTPS URL for a Telegram file (photo)."""
+def get_file_info(file_id: str) -> dict:
+    """Call getFile and return the result dict."""
     resp = requests.get(
         TELEGRAM_API_URL + "getFile",
         params={"file_id": file_id},
@@ -71,8 +81,47 @@ def get_file_url(file_id: str) -> str:
     data = resp.json()
     if not data.get("ok"):
         raise RuntimeError(f"Telegram getFile error: {data}")
-    file_path = data["result"]["file_path"]
-    return f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+    return data["result"]  # contains file_path, file_size, etc.
+
+
+def download_file_bytes(file_path: str) -> tuple[bytes, str]:
+    """
+    Download the Telegram file and return (bytes, mime_type).
+
+    Grok only supports image/jpeg, image/jpg, image/png, image/webp.
+    We'll try to detect or infer a correct mime.
+    """
+    url = TELEGRAM_FILE_API_URL + file_path
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    content = resp.content
+
+    # Try to read mime from headers; some Telegram setups may return octet-stream
+    mime = resp.headers.get("Content-Type", "").lower()
+
+    # If Telegram doesn't give a good mime, infer from extension
+    if mime not in ALLOWED_IMAGE_MIME:
+        lower_path = file_path.lower()
+        if lower_path.endswith(".jpg") or lower_path.endswith(".jpeg"):
+            mime = "image/jpeg"
+        elif lower_path.endswith(".png"):
+            mime = "image/png"
+        elif lower_path.endswith(".webp"):
+            mime = "image/webp"
+        # If still not allowed, we bail out
+        if mime not in ALLOWED_IMAGE_MIME:
+            raise RuntimeError(
+                f"Unsupported image mime type '{mime}' for file_path '{file_path}'. "
+                f"Allowed: {sorted(ALLOWED_IMAGE_MIME)}"
+            )
+
+    return content, mime
+
+
+def image_bytes_to_data_url(image_bytes: bytes, mime_type: str) -> str:
+    """Convert raw image bytes + mime into a data URL."""
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{mime_type};base64,{b64}"
 
 
 # ------------- OpenRouter / Grok helpers ------------- #
@@ -111,7 +160,6 @@ def call_grok_text(api_key: str, user_text: str) -> str:
     try:
         resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=90)
         if not resp.ok:
-            # Show full error body to user for easier debugging
             return f"❌ OpenRouter error {resp.status_code}: {resp.text}"
         data = resp.json()
         content = data["choices"][0]["message"]["content"]
@@ -121,8 +169,11 @@ def call_grok_text(api_key: str, user_text: str) -> str:
         return f"❌ Error talking to Grok: {e}"
 
 
-def analyze_image_with_grok(api_key: str, prompt: str, image_url: str) -> str:
-    """Send an image + text prompt to Grok for vision analysis."""
+def analyze_image_with_grok(api_key: str, prompt: str, image_data_url: str) -> str:
+    """
+    Send an image + text prompt to Grok for vision analysis,
+    using a data URL so xAI doesn't have to download anything.
+    """
     headers = _openrouter_headers(api_key)
 
     payload = {
@@ -132,7 +183,7 @@ def analyze_image_with_grok(api_key: str, prompt: str, image_url: str) -> str:
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
                 ],
             }
         ],
@@ -219,10 +270,18 @@ def handle_update(update: dict):
         try:
             # largest size is last item
             file_id = photo[-1]["file_id"]
-            image_url = get_file_url(file_id)
+            file_info = get_file_info(file_id)
+            file_path = file_info["file_path"]
+
+            img_bytes, mime = download_file_bytes(file_path)
+            data_url = image_bytes_to_data_url(img_bytes, mime)
         except Exception as e:
-            logger.exception("Error getting Telegram file URL: %s", e)
-            send_message(chat_id, "❌ Couldn’t fetch the image from Telegram.")
+            logger.exception("Error preparing image for Grok: %s", e)
+            send_message(
+                chat_id,
+                "❌ Couldn’t prepare the image for analysis. "
+                "Make sure you send a JPEG/PNG/WEBP photo."
+            )
             return
 
         # Use caption as prompt if present, otherwise a default prompt
@@ -231,7 +290,7 @@ def handle_update(update: dict):
         else:
             prompt = "Describe this image in detail and point out anything interesting or unusual."
 
-        reply = analyze_image_with_grok(api_key, prompt, image_url)
+        reply = analyze_image_with_grok(api_key, prompt, data_url)
         send_message(chat_id, reply)
         return
 
