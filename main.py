@@ -10,8 +10,11 @@ from fastapi.responses import JSONResponse
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-# Default to Grok 4.1 Fast (free) on OpenRouter
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "x-ai/grok-4.1-fast:free")
+
+# Optional: configure these in env if your OpenRouter key expects them
+OPENROUTER_REFERRER = os.getenv("OPENROUTER_REFERRER")  # e.g. https://your-site.com
+OPENROUTER_TITLE = os.getenv("OPENROUTER_TITLE", "Telegram Grok Vision Bot")
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in environment")
@@ -45,6 +48,7 @@ def send_message(chat_id: int, text: str):
 
 
 def _send_message_raw(chat_id: int, text: str):
+    resp = None
     try:
         resp = requests.post(
             TELEGRAM_API_URL + "sendMessage",
@@ -73,14 +77,22 @@ def get_file_url(file_id: str) -> str:
 
 # ------------- OpenRouter / Grok helpers ------------- #
 
-def call_grok_text(api_key: str, user_text: str) -> str:
-    """Text-only chat with Grok."""
+def _openrouter_headers(api_key: str) -> dict:
+    """Build headers for OpenRouter, with optional referrer/title."""
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://example.com",  # change to your site/repo if you have one
-        "X-Title": "Telegram Grok Vision Bot",
     }
+    if OPENROUTER_REFERRER:
+        headers["HTTP-Referer"] = OPENROUTER_REFERRER
+    if OPENROUTER_TITLE:
+        headers["X-Title"] = OPENROUTER_TITLE
+    return headers
+
+
+def call_grok_text(api_key: str, user_text: str) -> str:
+    """Text-only chat with Grok."""
+    headers = _openrouter_headers(api_key)
 
     payload = {
         "model": OPENROUTER_MODEL,
@@ -98,7 +110,9 @@ def call_grok_text(api_key: str, user_text: str) -> str:
 
     try:
         resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=90)
-        resp.raise_for_status()
+        if not resp.ok:
+            # Show full error body to user for easier debugging
+            return f"❌ OpenRouter error {resp.status_code}: {resp.text}"
         data = resp.json()
         content = data["choices"][0]["message"]["content"]
         return content
@@ -109,12 +123,7 @@ def call_grok_text(api_key: str, user_text: str) -> str:
 
 def analyze_image_with_grok(api_key: str, prompt: str, image_url: str) -> str:
     """Send an image + text prompt to Grok for vision analysis."""
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://example.com",
-        "X-Title": "Telegram Grok Vision Bot",
-    }
+    headers = _openrouter_headers(api_key)
 
     payload = {
         "model": OPENROUTER_MODEL,
@@ -131,7 +140,8 @@ def analyze_image_with_grok(api_key: str, prompt: str, image_url: str) -> str:
 
     try:
         resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=120)
-        resp.raise_for_status()
+        if not resp.ok:
+            return f"❌ OpenRouter error {resp.status_code}: {resp.text}"
         data = resp.json()
         content = data["choices"][0]["message"]["content"]
         return content
@@ -159,20 +169,24 @@ def handle_update(update: dict):
     photo = message.get("photo")
     caption = message.get("caption")
 
-    # 1) Commands from text
+    # 1) Commands and text
     if text:
         text = text.strip()
+
+        # Commands
         if text.startswith("/start"):
             handle_start(chat_id)
             return
+
         if text.startswith("/set_api_key"):
             handle_set_api_key_command(chat_id, user_id)
             return
+
         if text.startswith("/forget_key"):
             handle_forget_key(chat_id, user_id)
             return
 
-        # If waiting for key, treat text as the API key
+        # If waiting for API key, treat this text as the key
         if user_id in waiting_for_key:
             user_api_keys[user_id] = text
             waiting_for_key.remove(user_id)
@@ -221,7 +235,7 @@ def handle_update(update: dict):
         send_message(chat_id, reply)
         return
 
-    # Ignore other update types for now (video, stickers, etc.)
+    # Ignore other update types for now (video, stickers, documents, etc.)
 
 
 def handle_start(chat_id: int):
