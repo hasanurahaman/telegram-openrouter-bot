@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# Default to Grok 4.1 Fast (free) on OpenRouter
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "x-ai/grok-4.1-fast:free")
 
 if not TELEGRAM_BOT_TOKEN:
@@ -18,7 +19,7 @@ if not TELEGRAM_BOT_TOKEN:
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# In-memory storage (per process)
+# Per-process in-memory storage
 user_api_keys: dict[int, str] = {}   # telegram_user_id -> openrouter_api_key
 waiting_for_key: set[int] = set()    # users who just ran /set_api_key
 
@@ -55,40 +56,94 @@ def _send_message_raw(chat_id: int, text: str):
         logger.error("Error sending Telegram message: %s - resp=%s", e, getattr(resp, "text", ""))
 
 
-# ------------- OpenRouter helper ------------- #
+def get_file_url(file_id: str) -> str:
+    """Get a public HTTPS URL for a Telegram file (photo)."""
+    resp = requests.get(
+        TELEGRAM_API_URL + "getFile",
+        params={"file_id": file_id},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram getFile error: {data}")
+    file_path = data["result"]["file_path"]
+    return f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
 
-def call_openrouter(api_key: str, user_text: str) -> str:
+
+# ------------- OpenRouter / Grok helpers ------------- #
+
+def call_grok_text(api_key: str, user_text: str) -> str:
+    """Text-only chat with Grok."""
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        # optional but recommended:
         "HTTP-Referer": "https://example.com",  # change to your site/repo if you have one
-        "X-Title": "Telegram OpenRouter Bot",
+        "X-Title": "Telegram Grok Vision Bot",
     }
 
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": user_text},
+            {
+                "role": "system",
+                "content": "You are a helpful assistant that can also analyze images."
+            },
+            {
+                "role": "user",
+                "content": user_text,
+            },
         ],
     }
 
     try:
-        resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+        resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=90)
         resp.raise_for_status()
         data = resp.json()
         content = data["choices"][0]["message"]["content"]
         return content
     except Exception as e:
-        logger.exception("Error talking to OpenRouter")
-        return f"❌ Error talking to OpenRouter: {e}"
+        logger.exception("Error calling Grok (text): %s", e)
+        return f"❌ Error talking to Grok: {e}"
+
+
+def analyze_image_with_grok(api_key: str, prompt: str, image_url: str) -> str:
+    """Send an image + text prompt to Grok for vision analysis."""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://example.com",
+        "X-Title": "Telegram Grok Vision Bot",
+    }
+
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }
+        ],
+    }
+
+    try:
+        resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=120)
+        resp.raise_for_status()
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        return content
+    except Exception as e:
+        logger.exception("Error calling Grok (vision): %s", e)
+        return f"❌ Error while analyzing the image: {e}"
 
 
 # ------------- Update handling ------------- #
 
 def handle_update(update: dict):
-    """Process a single Telegram update dict."""
+    """Process a single Telegram update dict (text + photo support)."""
     if "message" not in update:
         return
 
@@ -96,51 +151,89 @@ def handle_update(update: dict):
     chat_id = message["chat"]["id"]
     from_user = message.get("from", {})
     user_id = from_user.get("id")
+
+    if user_id is None:
+        return
+
     text = message.get("text")
+    photo = message.get("photo")
+    caption = message.get("caption")
 
-    if user_id is None or text is None:
+    # 1) Commands from text
+    if text:
+        text = text.strip()
+        if text.startswith("/start"):
+            handle_start(chat_id)
+            return
+        if text.startswith("/set_api_key"):
+            handle_set_api_key_command(chat_id, user_id)
+            return
+        if text.startswith("/forget_key"):
+            handle_forget_key(chat_id, user_id)
+            return
+
+        # If waiting for key, treat text as the API key
+        if user_id in waiting_for_key:
+            user_api_keys[user_id] = text
+            waiting_for_key.remove(user_id)
+            send_message(chat_id, "✅ Your OpenRouter API key has been saved.")
+            return
+
+        # Normal text chat with Grok
+        api_key = user_api_keys.get(user_id)
+        if not api_key:
+            send_message(
+                chat_id,
+                "⚠️ You haven’t set an OpenRouter API key yet.\nUse /set_api_key first."
+            )
+            return
+
+        reply = call_grok_text(api_key, text)
+        send_message(chat_id, reply)
         return
 
-    text = text.strip()
+    # 2) Photo (vision analysis)
+    if photo:
+        api_key = user_api_keys.get(user_id)
+        if not api_key:
+            send_message(
+                chat_id,
+                "⚠️ You haven’t set an OpenRouter API key yet.\nUse /set_api_key first."
+            )
+            return
 
-    # Commands
-    if text.startswith("/start"):
-        handle_start(chat_id)
-        return
-    if text.startswith("/set_api_key"):
-        handle_set_api_key_command(chat_id, user_id)
-        return
-    if text.startswith("/forget_key"):
-        handle_forget_key(chat_id, user_id)
+        try:
+            # largest size is last item
+            file_id = photo[-1]["file_id"]
+            image_url = get_file_url(file_id)
+        except Exception as e:
+            logger.exception("Error getting Telegram file URL: %s", e)
+            send_message(chat_id, "❌ Couldn’t fetch the image from Telegram.")
+            return
+
+        # Use caption as prompt if present, otherwise a default prompt
+        if caption:
+            prompt = caption.strip()
+        else:
+            prompt = "Describe this image in detail and point out anything interesting or unusual."
+
+        reply = analyze_image_with_grok(api_key, prompt, image_url)
+        send_message(chat_id, reply)
         return
 
-    # If we’re waiting for this user's key, treat message as the key
-    if user_id in waiting_for_key:
-        user_api_keys[user_id] = text
-        waiting_for_key.remove(user_id)
-        send_message(chat_id, "✅ Your OpenRouter API key has been saved.")
-        return
-
-    # Normal chat
-    api_key = user_api_keys.get(user_id)
-    if not api_key:
-        send_message(
-            chat_id,
-            "⚠️ You haven’t set an OpenRouter API key yet.\nUse /set_api_key first."
-        )
-        return
-
-    reply = call_openrouter(api_key, text)
-    send_message(chat_id, reply)
+    # Ignore other update types for now (video, stickers, etc.)
 
 
 def handle_start(chat_id: int):
     text = (
-        "👋 Hi! I’m an AI chat bot using OpenRouter.\n\n"
+        "👋 Hi! I’m a Grok-powered bot via OpenRouter.\n\n"
+        "I can:\n"
+        "• Chat with you using text\n"
+        "• Analyze images you send (photos)\n\n"
         "To use me, you need *your own* OpenRouter API key:\n"
         "1️⃣ Get an API key from OpenRouter.\n"
         "2️⃣ Use /set_api_key and send me your key.\n"
-        "3️⃣ Then just chat with me normally.\n\n"
+        "3️⃣ Then send text or photos and I’ll use Grok to respond.\n\n"
         "You can remove your key with /forget_key."
     )
     send_message(chat_id, text)
@@ -167,7 +260,7 @@ def handle_forget_key(chat_id: int, user_id: int):
 
 @app.get("/")
 async def root():
-    return {"status": "ok"}
+    return {"status": "ok", "message": "Grok vision bot is running"}
 
 
 @app.post("/webhook")
@@ -179,5 +272,5 @@ async def telegram_webhook(request: Request):
         handle_update(update)
     except Exception as e:
         logger.exception("Error handling update: %s", e)
-    # Telegram requires a 200 OK quickly
+    # Telegram just needs a quick 200 OK
     return JSONResponse(content={"ok": True})
