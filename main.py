@@ -1,8 +1,9 @@
 import os
-import time
 import logging
 import requests
 from dotenv import load_dotenv
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 # ------------- Config ------------- #
 
@@ -12,12 +13,12 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "x-ai/grok-4.1-fast:free")
 
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in .env")
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in environment")
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# In-memory storage
+# In-memory storage (per process)
 user_api_keys: dict[int, str] = {}   # telegram_user_id -> openrouter_api_key
 waiting_for_key: set[int] = set()    # users who just ran /set_api_key
 
@@ -27,24 +28,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+app = FastAPI()
+
 
 # ------------- Telegram helpers ------------- #
-
-def get_updates(offset=None, timeout=30):
-    """Poll updates from Telegram using getUpdates."""
-    params = {
-        "timeout": timeout,
-    }
-    if offset is not None:
-        params["offset"] = offset
-
-    resp = requests.get(TELEGRAM_API_URL + "getUpdates", params=params, timeout=timeout+5)
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Telegram API error: {data}")
-    return data["result"]
-
 
 def send_message(chat_id: int, text: str):
     """Send a message to a Telegram chat, splitting if too long."""
@@ -57,18 +44,15 @@ def send_message(chat_id: int, text: str):
 
 
 def _send_message_raw(chat_id: int, text: str):
-    resp = requests.post(
-        TELEGRAM_API_URL + "sendMessage",
-        json={
-            "chat_id": chat_id,
-            "text": text,
-        },
-        timeout=20,
-    )
     try:
+        resp = requests.post(
+            TELEGRAM_API_URL + "sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=20,
+        )
         resp.raise_for_status()
     except Exception as e:
-        logger.error("Error sending message: %s - response: %s", e, resp.text)
+        logger.error("Error sending Telegram message: %s - resp=%s", e, getattr(resp, "text", ""))
 
 
 # ------------- OpenRouter helper ------------- #
@@ -77,7 +61,7 @@ def call_openrouter(api_key: str, user_text: str) -> str:
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        # Optional but recommended:
+        # optional but recommended:
         "HTTP-Referer": "https://example.com",  # change to your site/repo if you have one
         "X-Title": "Telegram OpenRouter Bot",
     }
@@ -101,10 +85,10 @@ def call_openrouter(api_key: str, user_text: str) -> str:
         return f"❌ Error talking to OpenRouter: {e}"
 
 
-# ------------- Update handler ------------- #
+# ------------- Update handling ------------- #
 
 def handle_update(update: dict):
-    """Process a single Telegram update."""
+    """Process a single Telegram update dict."""
     if "message" not in update:
         return
 
@@ -130,7 +114,7 @@ def handle_update(update: dict):
         handle_forget_key(chat_id, user_id)
         return
 
-    # If we’re waiting for this user's key, treat text as API key
+    # If we’re waiting for this user's key, treat message as the key
     if user_id in waiting_for_key:
         user_api_keys[user_id] = text
         waiting_for_key.remove(user_id)
@@ -142,8 +126,7 @@ def handle_update(update: dict):
     if not api_key:
         send_message(
             chat_id,
-            "⚠️ You haven’t set an OpenRouter API key yet.\n"
-            "Use /set_api_key first."
+            "⚠️ You haven’t set an OpenRouter API key yet.\nUse /set_api_key first."
         )
         return
 
@@ -180,27 +163,21 @@ def handle_forget_key(chat_id: int, user_id: int):
     send_message(chat_id, "✅ Your stored API key has been removed.")
 
 
-# ------------- Main loop ------------- #
+# ------------- FastAPI routes ------------- #
 
-def main():
-    logger.info("🤖 Bot is running (raw Telegram Bot API + requests). Press Ctrl+C to stop.")
-
-    last_update_id = None
-
-    while True:
-        try:
-            updates = get_updates(offset=last_update_id, timeout=30)
-            for update in updates:
-                last_update_id = update["update_id"] + 1
-                handle_update(update)
-        except KeyboardInterrupt:
-            print("\nStopping bot.")
-            break
-        except Exception as e:
-            logger.error("Error in update loop: %s", e)
-            # small sleep so we don't spin like crazy on errors
-            time.sleep(5)
+@app.get("/")
+async def root():
+    return {"status": "ok"}
 
 
-if __name__ == "__main__":
-    main()
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    """Telegram will POST updates here."""
+    update = await request.json()
+    logger.info("Received update: %s", update)
+    try:
+        handle_update(update)
+    except Exception as e:
+        logger.exception("Error handling update: %s", e)
+    # Telegram requires a 200 OK quickly
+    return JSONResponse(content={"ok": True})
